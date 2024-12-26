@@ -47,7 +47,6 @@ impl<T> Rcu<T> {
         let mut r = self.readers.load(Ordering::Acquire);
         loop {
             if r > 0 {
-                println!("going to sleep");
                 wait(&self.readers, r);
                 r = self.readers.load(Ordering::Acquire);
                 continue;
