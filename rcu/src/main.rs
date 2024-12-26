@@ -45,15 +45,32 @@ impl<T> Rcu<T> {
     pub fn write(&self, value: T) {
         let new_ptr = Box::into_raw(Box::new(value));
         let mut r = self.readers.load(Ordering::Acquire);
+        let mut old_ptr = self.pointer.load(Ordering::Acquire);
         loop {
+            if r < 1 {
+                match self.pointer.compare_exchange(
+                    old_ptr,
+                    new_ptr,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        drop(unsafe { Box::from_raw(old_ptr) });
+                        return;
+                    }
+                    Err(e) => {
+                        drop(unsafe { Box::from_raw(old_ptr) });
+                        old_ptr = e;
+                        continue;
+                    }
+                }
+            }
             if r > 0 {
                 wait(&self.readers, r);
                 r = self.readers.load(Ordering::Acquire);
+                old_ptr = self.pointer.load(Ordering::Acquire);
                 continue;
             }
-            let old_ptr = self.pointer.swap(new_ptr, Ordering::Release);
-            drop(unsafe { Box::from_raw(old_ptr) });
-            return;
         }
     }
 }
