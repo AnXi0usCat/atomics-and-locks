@@ -59,7 +59,6 @@ impl<T> Rcu<T> {
                         return;
                     }
                     Err(e) => {
-                        drop(unsafe { Box::from_raw(old_ptr) });
                         old_ptr = e;
                         continue;
                     }
