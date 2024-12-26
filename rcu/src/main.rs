@@ -14,17 +14,20 @@ fn main() {
     thread::scope(|s| {
         s.spawn(|| {
             println!("{}", *rcu.read());
-            std::thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(1));
             println!("{}", *rcu.read());
         });
+        thread::sleep(Duration::from_millis(1));
+        rcu.write(12);
     });
-    rcu.write(12);
 }
 
 struct Rcu<T> {
     pointer: AtomicPtr<T>,
     readers: AtomicU32,
 }
+
+unsafe impl<T> Sync for Rcu<T> where T: Send + Sync {}
 
 impl<T> Rcu<T> {
     pub fn new(value: T) -> Self {
@@ -44,6 +47,7 @@ impl<T> Rcu<T> {
         let mut r = self.readers.load(Ordering::Acquire);
         loop {
             if r > 0 {
+                println!("going to sleep");
                 wait(&self.readers, r);
                 r = self.readers.load(Ordering::Acquire);
                 continue;
