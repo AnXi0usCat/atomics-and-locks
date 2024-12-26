@@ -1,16 +1,24 @@
 use std::{
     ops::Deref,
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+    thread,
+    time::Duration,
 };
 
 use atomic_wait::{wait, wake_one};
 
 fn main() {
     println!("Hello, world!");
-}
+    let rcu = Rcu::new(10);
 
-struct Tested {
-    value: isize,
+    thread::scope(|s| {
+        s.spawn(|| {
+            println!("{}", *rcu.read());
+            std::thread::sleep(Duration::from_secs(1));
+            println!("{}", *rcu.read());
+        });
+    });
+    rcu.write(12);
 }
 
 struct Rcu<T> {
