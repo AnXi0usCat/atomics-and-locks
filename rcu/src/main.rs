@@ -97,4 +97,24 @@ mod tests {
             rcu.write(12);
         });
     }
+
+    #[test]
+    fn test_rcu_basic() {
+        let rcu = Rcu::new(10);
+
+        // read the value
+        {
+            let guard = rcu.read();
+            assert_eq!(10, *guard);
+        }
+        // update the value
+        let old_ptr = rcu.write(20);
+        unsafe {
+            drop(Box::from_raw(old_ptr));
+        }
+
+        // read the updated value
+        let guard = rcu.read();
+        assert_eq!(20, *guard);
+    }
 }
