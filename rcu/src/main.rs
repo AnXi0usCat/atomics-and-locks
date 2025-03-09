@@ -1,5 +1,9 @@
 use std::{
-    marker::PhantomData, ops::Deref, sync::atomic::{AtomicPtr, Ordering}, thread, time::Duration
+    marker::PhantomData,
+    ops::Deref,
+    sync::atomic::{AtomicPtr, Ordering},
+    thread,
+    time::Duration,
 };
 
 fn main() {
@@ -21,13 +25,13 @@ fn main() {
 }
 
 struct Rcu<T> {
-    ptr: AtomicPtr<T>
+    ptr: AtomicPtr<T>,
 }
 
 impl<T> Rcu<T> {
     pub fn new(value: T) -> Self {
         Rcu {
-            ptr: AtomicPtr::new(Box::into_raw(Box::new(value)))
+            ptr: AtomicPtr::new(Box::into_raw(Box::new(value))),
         }
     }
 
@@ -39,9 +43,9 @@ impl<T> Rcu<T> {
             }
             // check again to make sure it didnt change
             if self.ptr.load(Ordering::Acquire) == ptr {
-                return ReadGuard { 
-                    ptr, 
-                    _marker: PhantomData 
+                return ReadGuard {
+                    ptr,
+                    _marker: PhantomData,
                 };
             }
         }
@@ -62,7 +66,7 @@ impl<T> Drop for Rcu<T> {
 
 struct ReadGuard<'a, T> {
     ptr: *const T,
-    _marker: PhantomData<&'a T>
+    _marker: PhantomData<&'a T>,
 }
 
 impl<T> Deref for ReadGuard<'_, T> {
