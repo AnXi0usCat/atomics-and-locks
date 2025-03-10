@@ -1,7 +1,11 @@
 use std::{
     marker::PhantomData,
     ops::Deref,
-    sync::atomic::{AtomicPtr, Ordering},
+    ptr,
+    sync::{
+        atomic::{AtomicPtr, Ordering},
+        Mutex, OnceLock,
+    },
     thread,
     time::Duration,
 };
@@ -22,6 +26,38 @@ fn main() {
         thread::sleep(Duration::from_millis(1));
         rcu.write(12);
     });
+}
+
+pub struct HazardRecord {
+    pub hazard: AtomicPtr<()>,
+}
+
+struct HazardRecordPtr(*const HazardRecord);
+
+// SAFETY: We guarantee that HazardRecordPtr pointers are safely shared across threads.
+// This safety guarantee is your responsibility as the programmer.
+unsafe impl Send for HazardRecordPtr {}
+unsafe impl Sync for HazardRecordPtr {}
+
+static GLOBAL_HAZARD_REGISTRY: OnceLock<Mutex<Vec<HazardRecordPtr>>> = OnceLock::new();
+
+fn get_global_hazard_registry() -> &'static Mutex<Vec<HazardRecordPtr>> {
+    GLOBAL_HAZARD_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+thread_local! {
+    static HAZARD_RECORD: HazardRecord = {
+        let record = HazardRecord {
+            hazard: AtomicPtr::new(ptr::null_mut()),
+        };
+
+        get_global_hazard_registry()
+            .lock()
+            .expect("Lock poisoned")
+            .push(HazardRecordPtr(&record as *const HazardRecord));
+
+        record
+    };
 }
 
 struct Rcu<T> {
