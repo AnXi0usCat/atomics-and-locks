@@ -60,8 +60,7 @@ thread_local! {
 fn set_hazard<T>(ptr: *mut T) {
     HAZARD_RECORD.with(|record| {
         record.hazard.store(ptr as *mut (), Ordering::Release);
-    });
-    HAZARD_RECORD.with(|record| {
+        
         let ptr = record as *const HazardRecord;
         get_global_hazard_registry()
             .lock()
