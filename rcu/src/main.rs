@@ -51,21 +51,26 @@ fn get_global_retired_list() -> &'static Mutex<Vec<Ptr>> {
 }
 
 thread_local! {
-    static HAZARD_RECORD: HazardRecord = HazardRecord {
+    static HAZARD_RECORD: HazardRecord = {
+        let record = HazardRecord {
             hazard: AtomicPtr::new(ptr::null_mut()),
         };
+
+        let ptr = &record as *const HazardRecord;
+
+        get_global_hazard_registry()
+            .lock()
+            .expect("Lock poisoned")
+            .push(HazardRecordPtr(ptr));
+
+        record
+    }
 }
 
 // sets a hazard pointer to the current thread local storage
 fn set_hazard<T>(ptr: *mut T) {
     HAZARD_RECORD.with(|record| {
         record.hazard.store(ptr as *mut (), Ordering::Release);
-        
-        let ptr = record as *const HazardRecord;
-        get_global_hazard_registry()
-            .lock()
-            .expect("Lock poisoned")
-            .push(HazardRecordPtr(ptr));
     });
 }
 
@@ -131,6 +136,9 @@ impl<T> Rcu<T> {
             if ptr.is_null() {
                 panic!("Failed to read pointer, poitner cannot be null");
             }
+            // set the hazard pointer to global registry
+            set_hazard(ptr);
+
             // check again to make sure it didnt change
             if self.ptr.load(Ordering::Acquire) == ptr {
                 return ReadGuard {
@@ -141,15 +149,21 @@ impl<T> Rcu<T> {
         }
     }
 
-    pub fn write(&self, value: T) -> *mut T {
+    pub fn write(&self, value: T) {
         let new_ptr = Box::into_raw(Box::new(value));
         let old_ptr = self.ptr.swap(new_ptr, Ordering::AcqRel);
-        old_ptr
+        // retire the old pointer to the global retired list
+        retire(old_ptr as *mut ());
     }
 }
 
 impl<T> Drop for Rcu<T> {
     fn drop(&mut self) {
+        // clear out the retired list so we will not leak memory
+        scan_and_reclaim();
+        // SAFETY: we are dropping the RCU, means ther are no longer any readers
+        // so the value is safe to drop. Pointer was created from a box so we need
+        // to box it again to drop it.
         drop(unsafe { Box::from_raw(self.ptr.load(Ordering::Acquire)) });
     }
 }
@@ -162,13 +176,16 @@ struct ReadGuard<'a, T> {
 impl<T> Deref for ReadGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
+        // SAFETY: we know that if we obtained the read guard then the pointer is not null
+        // and was inserted in to the global hazard registry, so it is safe to dereference
         unsafe { &*self.ptr }
     }
 }
 
 impl<T> Drop for ReadGuard<'_, T> {
     fn drop(&mut self) {
-        // will use this later to clear the hazard pointer
+        // clear the hazard pointer
+        clear_hazard();
     }
 }
 
@@ -176,9 +193,25 @@ impl<T> Drop for ReadGuard<'_, T> {
 mod tests {
 
     use super::*;
+    
+    // ensure initialization explicitly
+    fn init_hazard_record() {
+        HAZARD_RECORD.with(|_| {});
+    }
+
+    fn deregister_thread_hazard() {
+        HAZARD_RECORD.with(|record| {
+            let ptr = record as *const HazardRecord;
+            let mut registry = get_global_hazard_registry().lock().expect("Lock poisoned");
+            registry.retain(|&record_ptr| record_ptr.0 != ptr);
+        });
+    }
 
     #[test]
     fn test_rcu_basic() {
+        // Ensure thread-local storage initialized
+        init_hazard_record();
+
         let rcu = Rcu::new(10);
 
         // read the value
@@ -187,23 +220,23 @@ mod tests {
             assert_eq!(10, *guard);
         }
         // update the value
-        let old_ptr = rcu.write(20);
-        unsafe {
-            drop(Box::from_raw(old_ptr));
-        }
+        rcu.write(20);
 
         // read the updated value
         let guard = rcu.read();
         assert_eq!(20, *guard);
+
+        deregister_thread_hazard();
     }
 
     #[test]
     fn test_set_and_clear() {
+        init_hazard_record();
+
         let boxed = Box::new(42);
         let raw_ptr = Box::into_raw(boxed);
 
         // Ensure thread-local storage initialized
-        HAZARD_RECORD.with(|_| {});
 
         // Set hazard pointer
         set_hazard(raw_ptr);
@@ -229,12 +262,17 @@ mod tests {
         unsafe {
             drop(Box::from_raw(raw_ptr));
         }
+
+        deregister_thread_hazard();
     }
 
     #[test]
     fn test_retire_and_scan() {
         let x = Box::new(42);
         let raw = Box::into_raw(x) as *mut ();
+
+        // Ensure thread-local storage initialized
+        init_hazard_record();
 
         // add pointer to the retire list
         retire(raw);
@@ -254,5 +292,7 @@ mod tests {
             .expect("lock poisoned")
             .iter()
             .any(|&Ptr(ptr)| ptr == raw));
+
+        deregister_thread_hazard();
     }
 }
