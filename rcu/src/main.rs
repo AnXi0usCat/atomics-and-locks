@@ -5,7 +5,7 @@ use std::{
     sync::{
         atomic::{AtomicPtr, Ordering},
         Mutex, OnceLock,
-    }
+    },
 };
 
 fn main() {
@@ -31,10 +31,23 @@ impl Deref for HazardRecordPtr {
 unsafe impl Send for HazardRecordPtr {}
 unsafe impl Sync for HazardRecordPtr {}
 
+#[derive(Clone, Copy)]
+struct Ptr(*mut ());
+
+// SAFETY: We guarantee that Ptr pointers are safely shared across threads.
+// This safety guarantee is your responsibility as the programmer.
+unsafe impl Send for Ptr {}
+unsafe impl Sync for Ptr {}
+
 static GLOBAL_HAZARD_REGISTRY: OnceLock<Mutex<Vec<HazardRecordPtr>>> = OnceLock::new();
+static GLOBAL_RETIRED_LIST: OnceLock<Mutex<Vec<Ptr>>> = OnceLock::new();
 
 fn get_global_hazard_registry() -> &'static Mutex<Vec<HazardRecordPtr>> {
     GLOBAL_HAZARD_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn get_global_retired_list() -> &'static Mutex<Vec<Ptr>> {
+    GLOBAL_RETIRED_LIST.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 thread_local! {
@@ -42,7 +55,6 @@ thread_local! {
             hazard: AtomicPtr::new(ptr::null_mut()),
         };
 }
-
 
 // sets a hazard pointer to the current thread local storage
 fn set_hazard<T>(ptr: *mut T) {
@@ -70,8 +82,37 @@ fn get_hazard_pointers() -> Vec<*mut ()> {
     let registry = get_global_hazard_registry().lock().expect("Lock poisoned");
     registry
         .iter()
-        .map(|record_ptr| (*record_ptr).hazard.load(Ordering::Acquire))
+        .map(|&record_ptr| (*record_ptr).hazard.load(Ordering::Acquire))
         .collect()
+}
+
+// retires a pointer by adding it to the global retired list
+fn retire(ptr: *mut ()) {
+    let mut retired = get_global_retired_list().lock().expect("Lock poisoned");
+    retired.push(Ptr(ptr));
+
+    // set an arbitrary value for now, should be configurable
+    if retired.len() >= 10 {
+        scan_and_reclaim();
+    }
+}
+
+// clears out pointers out of retired lisr periodically
+fn scan_and_reclaim() {
+    let hazards = get_hazard_pointers();
+    let mut retired = get_global_retired_list().lock().expect("Lock poisoned");
+
+    let mut i = 0;
+    while i < retired.len() {
+        let Ptr(ptr) = retired[i];
+        if !hazards.iter().any(|&raw| raw == ptr) {
+            let Ptr(old) = retired.swap_remove(i);
+            // SAFETY: pointer was created from a boxed value
+            unsafe { drop(Box::from_raw(old)) };
+        } else {
+            i += 1;
+        }
+    }
 }
 
 struct Rcu<T> {
@@ -189,5 +230,30 @@ mod tests {
         unsafe {
             drop(Box::from_raw(raw_ptr));
         }
+    }
+
+    #[test]
+    fn test_retire_and_scan() {
+        let x = Box::new(42);
+        let raw = Box::into_raw(x) as *mut ();
+
+        // add pointer to the retire list
+        retire(raw);
+
+        // pointer should be in the retired list now
+        assert!(get_global_retired_list()
+            .lock()
+            .expect("lock poisoned")
+            .iter()
+            .any(|&Ptr(ptr)| ptr == raw));
+
+        // if no pointer is in hazard list then it should be reclaimed
+        scan_and_reclaim();
+
+        assert!(!get_global_retired_list()
+            .lock()
+            .expect("lock poisoned")
+            .iter()
+            .any(|&Ptr(ptr)| ptr == raw));
     }
 }
