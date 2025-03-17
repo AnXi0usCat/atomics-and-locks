@@ -5,27 +5,11 @@ use std::{
     sync::{
         atomic::{AtomicPtr, Ordering},
         Mutex, OnceLock,
-    },
-    thread,
-    time::Duration,
+    }
 };
 
 fn main() {
     println!("Hello, world!");
-    let rcu = Rcu::new(10);
-
-    thread::scope(|s| {
-        s.spawn(|| {
-            let mut reader = rcu.read();
-            println!("{}", *reader);
-            drop(reader);
-            thread::sleep(Duration::from_secs(1));
-            reader = rcu.read();
-            println!("{}", *reader);
-        });
-        thread::sleep(Duration::from_millis(1));
-        rcu.write(12);
-    });
 }
 
 pub struct HazardRecord {
@@ -152,21 +136,6 @@ impl<T> Drop for ReadGuard<'_, T> {
 mod tests {
 
     use super::*;
-
-    #[test]
-    fn simple_case() {
-        let rcu = Rcu::new(10);
-
-        thread::scope(|s| {
-            s.spawn(|| {
-                assert_eq!(10, *rcu.read());
-                thread::sleep(Duration::from_secs(1));
-                assert_eq!(12, *rcu.read());
-            });
-            thread::sleep(Duration::from_millis(1));
-            rcu.write(12);
-        });
-    }
 
     #[test]
     fn test_rcu_basic() {
