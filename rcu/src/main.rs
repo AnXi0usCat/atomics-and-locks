@@ -51,19 +51,19 @@ fn get_global_retired_list() -> &'static Mutex<Vec<Ptr>> {
 }
 
 thread_local! {
-    static HAZARD_RECORD: HazardRecord = {
-        let record = HazardRecord {
+    static HAZARD_RECORD: &'static HazardRecord = {
+        let record = Box::new(HazardRecord {
             hazard: AtomicPtr::new(ptr::null_mut()),
-        };
+        });
 
-        let ptr = &record as *const HazardRecord;
+        let record_ref: &'static HazardRecord = Box::leak(record);
 
         get_global_hazard_registry()
             .lock()
             .expect("Lock poisoned")
-            .push(HazardRecordPtr(ptr));
+            .push(HazardRecordPtr(record_ref as *const HazardRecord));
 
-        record
+        record_ref
     }
 }
 
@@ -193,25 +193,9 @@ impl<T> Drop for ReadGuard<'_, T> {
 mod tests {
 
     use super::*;
-    
-    // ensure initialization explicitly
-    fn init_hazard_record() {
-        HAZARD_RECORD.with(|_| {});
-    }
-
-    fn deregister_thread_hazard() {
-        HAZARD_RECORD.with(|record| {
-            let ptr = record as *const HazardRecord;
-            let mut registry = get_global_hazard_registry().lock().expect("Lock poisoned");
-            registry.retain(|&record_ptr| record_ptr.0 != ptr);
-        });
-    }
 
     #[test]
     fn test_rcu_basic() {
-        // Ensure thread-local storage initialized
-        init_hazard_record();
-
         let rcu = Rcu::new(10);
 
         // read the value
@@ -225,14 +209,10 @@ mod tests {
         // read the updated value
         let guard = rcu.read();
         assert_eq!(20, *guard);
-
-        deregister_thread_hazard();
     }
 
     #[test]
     fn test_set_and_clear() {
-        init_hazard_record();
-
         let boxed = Box::new(42);
         let raw_ptr = Box::into_raw(boxed);
 
@@ -262,17 +242,12 @@ mod tests {
         unsafe {
             drop(Box::from_raw(raw_ptr));
         }
-
-        deregister_thread_hazard();
     }
 
     #[test]
     fn test_retire_and_scan() {
         let x = Box::new(42);
         let raw = Box::into_raw(x) as *mut ();
-
-        // Ensure thread-local storage initialized
-        init_hazard_record();
 
         // add pointer to the retire list
         retire(raw);
@@ -292,7 +267,5 @@ mod tests {
             .expect("lock poisoned")
             .iter()
             .any(|&Ptr(ptr)| ptr == raw));
-
-        deregister_thread_hazard();
     }
 }
