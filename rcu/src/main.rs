@@ -3,8 +3,7 @@ use std::{
     ops::Deref,
     ptr,
     sync::{
-        atomic::{AtomicPtr, Ordering},
-        Mutex, OnceLock,
+        atomic::{AtomicPtr, Ordering}, Mutex
     },
 };
 
@@ -16,20 +15,10 @@ pub struct HazardRecord {
     pub hazard: AtomicPtr<()>,
 }
 
-#[derive(Clone, Copy)]
-struct HazardRecordPtr(*const HazardRecord);
-
-impl Deref for HazardRecordPtr {
-    type Target = HazardRecord;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.0 }
-    }
-}
-
 // SAFETY: We guarantee that HazardRecordPtr pointers are safely shared across threads.
 // This safety guarantee is your responsibility as the programmer.
-unsafe impl Send for HazardRecordPtr {}
-unsafe impl Sync for HazardRecordPtr {}
+unsafe impl Send for HazardRecord {}
+unsafe impl Sync for HazardRecord {}
 
 #[derive(Clone, Copy)]
 struct Ptr(*mut ());
@@ -39,94 +28,24 @@ struct Ptr(*mut ());
 unsafe impl Send for Ptr {}
 unsafe impl Sync for Ptr {}
 
-static GLOBAL_HAZARD_REGISTRY: OnceLock<Mutex<Vec<HazardRecordPtr>>> = OnceLock::new();
-static GLOBAL_RETIRED_LIST: OnceLock<Mutex<Vec<Ptr>>> = OnceLock::new();
-
-fn get_global_hazard_registry() -> &'static Mutex<Vec<HazardRecordPtr>> {
-    GLOBAL_HAZARD_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn get_global_retired_list() -> &'static Mutex<Vec<Ptr>> {
-    GLOBAL_RETIRED_LIST.get_or_init(|| Mutex::new(Vec::new()))
-}
-
 thread_local! {
-    static HAZARD_RECORD: &'static HazardRecord = {
-        let record = Box::new(HazardRecord {
+    static HAZARD_RECORD: HazardRecord = HazardRecord {
             hazard: AtomicPtr::new(ptr::null_mut()),
-        });
-
-        let record_ref: &'static HazardRecord = Box::leak(record);
-
-        get_global_hazard_registry()
-            .lock()
-            .expect("Lock poisoned")
-            .push(HazardRecordPtr(record_ref as *const HazardRecord));
-
-        record_ref
-    }
-}
-
-// sets a hazard pointer to the current thread local storage
-fn set_hazard<T>(ptr: *mut T) {
-    HAZARD_RECORD.with(|record| {
-        record.hazard.store(ptr as *mut (), Ordering::Release);
-    });
-}
-
-// clears a hazard pointer from the current thread local storage
-fn clear_hazard() {
-    HAZARD_RECORD.with(|record| {
-        record.hazard.store(ptr::null_mut(), Ordering::Release);
-    });
-}
-
-// get a snapshot of all published hazard pointers accros threads
-fn get_hazard_pointers() -> Vec<*mut ()> {
-    let registry = get_global_hazard_registry().lock().expect("Lock poisoned");
-    registry
-        .iter()
-        .map(|&record_ptr| (*record_ptr).hazard.load(Ordering::Acquire))
-        .collect()
-}
-
-// retires a pointer by adding it to the global retired list
-fn retire(ptr: *mut ()) {
-    let mut retired = get_global_retired_list().lock().expect("Lock poisoned");
-    retired.push(Ptr(ptr));
-
-    // set an arbitrary value for now, should be configurable
-    if retired.len() >= 10 {
-        scan_and_reclaim();
-    }
-}
-
-// clears out pointers out of retired lisr periodically
-fn scan_and_reclaim() {
-    let hazards = get_hazard_pointers();
-    let mut retired = get_global_retired_list().lock().expect("Lock poisoned");
-
-    let mut i = 0;
-    while i < retired.len() {
-        let Ptr(ptr) = retired[i];
-        if !hazards.iter().any(|&raw| raw == ptr) {
-            let Ptr(old) = retired.swap_remove(i);
-            // SAFETY: pointer was created from a boxed value
-            unsafe { drop(Box::from_raw(old)) };
-        } else {
-            i += 1;
-        }
     }
 }
 
 struct Rcu<T> {
     ptr: AtomicPtr<T>,
+    registry: Mutex<Vec<HazardRecord>>,
+    retired_list: Mutex<Vec<Ptr>>,
 }
 
 impl<T> Rcu<T> {
     pub fn new(value: T) -> Self {
         Rcu {
             ptr: AtomicPtr::new(Box::into_raw(Box::new(value))),
+            registry: Mutex::new(Vec::new()),
+            retired_list: Mutex::new(Vec::new()),
         }
     }
 
@@ -137,12 +56,13 @@ impl<T> Rcu<T> {
                 panic!("Failed to read pointer, poitner cannot be null");
             }
             // set the hazard pointer to global registry
-            set_hazard(ptr);
+            self.set_hazard(ptr);
 
             // check again to make sure it didnt change
             if self.ptr.load(Ordering::Acquire) == ptr {
                 return ReadGuard {
                     ptr,
+                    rcu: self,
                     _marker: PhantomData,
                 };
             }
@@ -153,14 +73,66 @@ impl<T> Rcu<T> {
         let new_ptr = Box::into_raw(Box::new(value));
         let old_ptr = self.ptr.swap(new_ptr, Ordering::AcqRel);
         // retire the old pointer to the global retired list
-        retire(old_ptr as *mut ());
+        self.retire(old_ptr as *mut ());
+    }
+
+    // sets a hazard pointer to the current thread local storage
+    fn set_hazard(&self, ptr: *mut T) {
+        HAZARD_RECORD.with(|record| {
+            record.hazard.store(ptr as *mut (), Ordering::Release);
+        });
+    }
+
+    // clears a hazard pointer from the current thread local storage
+    fn clear_hazard(&self) {
+        HAZARD_RECORD.with(|record| {
+            record.hazard.store(ptr::null_mut(), Ordering::Release);
+        });
+    }
+
+    // get a snapshot of all published hazard pointers accros threads
+    fn get_hazard_pointers(&self) -> Vec<*mut ()> {
+        let registry = self.registry.lock().expect("Lock poisoned");
+        registry
+            .iter()
+            .map(|record_ptr| record_ptr.hazard.load(Ordering::Acquire))
+            .collect()
+    }
+
+    // retires a pointer by adding it to the global retired list
+    fn retire(&self, ptr: *mut ()) {
+        let mut retired = self.retired_list.lock().expect("Lock poisoned");
+        retired.push(Ptr(ptr));
+
+        // set an arbitrary value for now, should be configurable
+        if retired.len() >= 10 {
+            self.scan_and_reclaim();
+        }
+    }
+
+    // clears out pointers out of retired lisr periodically
+    fn scan_and_reclaim(&self) {
+        let hazards = self.get_hazard_pointers();
+        let mut retired = self.retired_list.lock().expect("Lock poisoned");
+
+        let mut i = 0;
+        while i < retired.len() {
+            let Ptr(ptr) = retired[i];
+            if !hazards.iter().any(|&raw| raw == ptr) {
+                let Ptr(old) = retired.swap_remove(i);
+                // SAFETY: pointer was created from a boxed value
+                unsafe { drop(Box::from_raw(old)) };
+            } else {
+                i += 1;
+            }
+        }
     }
 }
 
 impl<T> Drop for Rcu<T> {
     fn drop(&mut self) {
         // clear out the retired list so we will not leak memory
-        scan_and_reclaim();
+        self.scan_and_reclaim();
         // SAFETY: we are dropping the RCU, means ther are no longer any readers
         // so the value is safe to drop. Pointer was created from a box so we need
         // to box it again to drop it.
@@ -170,6 +142,7 @@ impl<T> Drop for Rcu<T> {
 
 struct ReadGuard<'a, T> {
     ptr: *const T,
+    rcu: &'a Rcu<T>,
     _marker: PhantomData<&'a T>,
 }
 
@@ -185,7 +158,7 @@ impl<T> Deref for ReadGuard<'_, T> {
 impl<T> Drop for ReadGuard<'_, T> {
     fn drop(&mut self) {
         // clear the hazard pointer
-        clear_hazard();
+        self.rcu.clear_hazard();
     }
 }
 
@@ -213,16 +186,10 @@ mod tests {
 
     #[test]
     fn test_set_and_clear() {
-        let boxed = Box::new(42);
-        let raw_ptr = Box::into_raw(boxed);
-
-        // Ensure thread-local storage initialized
-
-        // Set hazard pointer
-        set_hazard(raw_ptr);
+        let rcu = Rcu::new(10);
 
         println!("--- Hazard pointers snapshot ---");
-        let hazards = get_hazard_pointers();
+        let hazards = rcu.get_hazard_pointers();
 
         assert!(
             !hazards.is_empty(),
@@ -236,33 +203,29 @@ mod tests {
         }
 
         // Clear hazard pointer
-        clear_hazard();
-
-        // Cleanup to avoid leaks
-        unsafe {
-            drop(Box::from_raw(raw_ptr));
-        }
+        rcu.clear_hazard();
     }
 
     #[test]
     fn test_retire_and_scan() {
-        let x = Box::new(42);
-        let raw = Box::into_raw(x) as *mut ();
-
+        let rcu = Rcu::new(10);
+        let hazards = rcu.get_hazard_pointers();
+        
+        let raw = *hazards.get(0).unwrap();
         // add pointer to the retire list
-        retire(raw);
+        rcu.retire(raw);
 
         // pointer should be in the retired list now
-        assert!(get_global_retired_list()
+        assert!(rcu.retired_list
             .lock()
             .expect("lock poisoned")
             .iter()
             .any(|&Ptr(ptr)| ptr == raw));
 
         // if no pointer is in hazard list then it should be reclaimed
-        scan_and_reclaim();
+        rcu.scan_and_reclaim();
 
-        assert!(!get_global_retired_list()
+        assert!(!rcu.retired_list
             .lock()
             .expect("lock poisoned")
             .iter()
