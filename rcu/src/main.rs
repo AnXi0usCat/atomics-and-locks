@@ -1,10 +1,8 @@
 use std::{
-    marker::PhantomData,
-    ops::Deref,
-    ptr,
-    sync::{
-        atomic::{AtomicPtr, Ordering}, Mutex
-    },
+    marker::PhantomData, ops::Deref, ptr, sync::{
+        atomic::{AtomicPtr, Ordering},
+        Mutex,
+    }
 };
 
 fn main() {
@@ -28,15 +26,21 @@ struct Ptr(*mut ());
 unsafe impl Send for Ptr {}
 unsafe impl Sync for Ptr {}
 
+static UNINITIALIZED_FLAG: u8 = 0;
+
 thread_local! {
-    static HAZARD_RECORD: HazardRecord = HazardRecord {
-            hazard: AtomicPtr::new(ptr::null_mut()),
+    static HAZARD_RECORD: &'static HazardRecord = {
+        let record = Box::new(HazardRecord {
+            hazard: AtomicPtr::new(UNINITIALIZED_FLAG as *mut ()),
+        });
+        let record_ref = Box::leak(record);
+        record_ref
     }
 }
 
 struct Rcu<T> {
     ptr: AtomicPtr<T>,
-    registry: Mutex<Vec<HazardRecord>>,
+    registry: Mutex<Vec<&'static HazardRecord>>,
     retired_list: Mutex<Vec<Ptr>>,
 }
 
@@ -55,9 +59,23 @@ impl<T> Rcu<T> {
             if ptr.is_null() {
                 panic!("Failed to read pointer, poitner cannot be null");
             }
-            // set the hazard pointer to global registry
-            self.set_hazard(ptr);
-
+            if HAZARD_RECORD
+                .try_with(|record| {
+                    record.hazard.load(Ordering::Acquire) == UNINITIALIZED_FLAG as *mut ()
+                })
+                .is_ok()
+            {
+                // set the hazard pointer to global registry
+                self.set_hazard(ptr);
+                HAZARD_RECORD.with(|hazard| {
+                    self.registry
+                        .lock()
+                        .expect("Lock poisoned")
+                        .push(&hazard)
+                });
+            } else {
+                self.set_hazard(ptr);
+            }
             // check again to make sure it didnt change
             if self.ptr.load(Ordering::Acquire) == ptr {
                 return ReadGuard {
@@ -96,6 +114,7 @@ impl<T> Rcu<T> {
         registry
             .iter()
             .map(|record_ptr| record_ptr.hazard.load(Ordering::Acquire))
+            .filter(|&ptr| !ptr.is_null())
             .collect()
     }
 
@@ -187,10 +206,9 @@ mod tests {
     #[test]
     fn test_set_and_clear() {
         let rcu = Rcu::new(10);
-
-        println!("--- Hazard pointers snapshot ---");
+        let record = rcu.read();
+        
         let hazards = rcu.get_hazard_pointers();
-
         assert!(
             !hazards.is_empty(),
             "Hazard pointer registry unexpectedly empty!"
@@ -199,36 +217,50 @@ mod tests {
         for &ptr in &hazards {
             let val = unsafe { *(ptr as *mut i32) };
             println!("Hazard pointer points to: {}", val);
-            assert_eq!(val, 42, "Expected pointer value to be 42, but got {}", val);
+            assert_eq!(val, 10, "Expected pointer value to be 10, but got {}", val);
+        }
+        // Clear hazard pointer
+        drop(record);
+
+        let hazards = rcu.get_hazard_pointers();
+        for &ptr in &hazards {
+            assert!(ptr.is_null(), "Pointer has not been cleared");
         }
 
-        // Clear hazard pointer
-        rcu.clear_hazard();
+        HAZARD_RECORD.with(|record| {
+            assert!(
+                record.hazard.load(Ordering::Acquire).is_null(),
+                "Thread local hazard pointer is not null.",
+            )
+        });
     }
 
     #[test]
     fn test_retire_and_scan() {
         let rcu = Rcu::new(10);
-        let hazards = rcu.get_hazard_pointers();
-        
-        let raw = *hazards.get(0).unwrap();
-        // add pointer to the retire list
-        rcu.retire(raw);
+        // read the value to create a hazard pointer
+        let _ = rcu.read();
+        // write new value to force the old one in the retired list
+        rcu.write(20);
 
         // pointer should be in the retired list now
-        assert!(rcu.retired_list
-            .lock()
-            .expect("lock poisoned")
-            .iter()
-            .any(|&Ptr(ptr)| ptr == raw));
+        assert!(
+            !rcu.retired_list
+                .lock()
+                .expect("lock poisoned")
+                .is_empty(),
+            "Retired list is unexpectedly empty"
+        );
 
         // if no pointer is in hazard list then it should be reclaimed
         rcu.scan_and_reclaim();
 
-        assert!(!rcu.retired_list
-            .lock()
-            .expect("lock poisoned")
-            .iter()
-            .any(|&Ptr(ptr)| ptr == raw));
+        assert!(
+            rcu.retired_list
+                .lock()
+                .expect("lock poisoned")
+                .is_empty(),
+            "Pointer has not been reclaimed from the hazard list"
+        );
     }
 }
