@@ -1,8 +1,11 @@
 use std::{
-    marker::PhantomData, ops::Deref, ptr, sync::{
+    marker::PhantomData,
+    ops::Deref,
+    ptr,
+    sync::{
         atomic::{AtomicPtr, Ordering},
         Mutex,
-    }
+    },
 };
 
 fn main() {
@@ -60,19 +63,14 @@ impl<T> Rcu<T> {
                 panic!("Failed to read pointer, poitner cannot be null");
             }
             if HAZARD_RECORD
-                .try_with(|record| {
-                    record.hazard.load(Ordering::Acquire) == UNINITIALIZED_FLAG as *mut ()
-                })
-                .is_ok()
+                .try_with(|record| record.hazard.load(Ordering::Acquire))
+                .unwrap()
+                == UNINITIALIZED_FLAG as *mut ()
             {
                 // set the hazard pointer to global registry
                 self.set_hazard(ptr);
-                HAZARD_RECORD.with(|hazard| {
-                    self.registry
-                        .lock()
-                        .expect("Lock poisoned")
-                        .push(&hazard)
-                });
+                HAZARD_RECORD
+                    .with(|hazard| self.registry.lock().expect("Lock poisoned").push(&hazard));
             } else {
                 self.set_hazard(ptr);
             }
@@ -184,6 +182,8 @@ impl<T> Drop for ReadGuard<'_, T> {
 #[cfg(test)]
 mod tests {
 
+    use std::rc;
+
     use super::*;
 
     #[test]
@@ -207,7 +207,7 @@ mod tests {
     fn test_set_and_clear() {
         let rcu = Rcu::new(10);
         let record = rcu.read();
-        
+
         let hazards = rcu.get_hazard_pointers();
         assert!(
             !hazards.is_empty(),
@@ -245,10 +245,7 @@ mod tests {
 
         // pointer should be in the retired list now
         assert!(
-            !rcu.retired_list
-                .lock()
-                .expect("lock poisoned")
-                .is_empty(),
+            !rcu.retired_list.lock().expect("lock poisoned").is_empty(),
             "Retired list is unexpectedly empty"
         );
 
@@ -256,11 +253,31 @@ mod tests {
         rcu.scan_and_reclaim();
 
         assert!(
-            rcu.retired_list
-                .lock()
-                .expect("lock poisoned")
-                .is_empty(),
+            rcu.retired_list.lock().expect("lock poisoned").is_empty(),
             "Pointer has not been reclaimed from the hazard list"
         );
+    }
+
+    #[test]
+    fn test_one_hazard_per_thread() {
+        let rcu = Rcu::new(10);
+        // reading the value will push a pointer to a hazard list
+        let value_1 = rcu.read();
+
+        assert!(
+            rcu.registry.lock().expect("lock poinsoned").len() == 1,
+            "Should contain only one record per thread"
+        );
+
+        // second read should update exisitng hazard record
+        let value_2 = rcu.read();
+
+        assert!(
+            rcu.registry.lock().expect("lock poinsoned").len() == 1,
+            "Should contain only one record per thread"
+        );
+
+        drop(value_1);
+        drop(value_2);
     }
 }
