@@ -307,5 +307,9 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
             rcu.write(20);
         });
+        assert!(
+            rcu.retired_list.lock().expect("lock poisoned").len() == 1,
+            "Doesnt have exatrly 1 element in retired list"
+        )
     }
 }
