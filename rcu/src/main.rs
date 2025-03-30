@@ -182,7 +182,12 @@ impl<T> Drop for ReadGuard<'_, T> {
 #[cfg(test)]
 mod tests {
 
-    use std::rc;
+    use std::{
+        rc,
+        sync::Arc,
+        thread::{self, sleep},
+        time::Duration,
+    };
 
     use super::*;
 
@@ -279,5 +284,32 @@ mod tests {
 
         drop(value_1);
         drop(value_2);
+    }
+
+    #[test]
+    fn test_read_from_different_thread() {
+        let rcu = Arc::new(Rcu::new(10));
+        thread::scope(|scope| {
+            let rcu_2 = rcu.clone();
+            scope.spawn(move || {
+                // read the value, should be equal to 10
+                let value = rcu_2.read();
+                assert_eq!(*value, 10, "Value should be equal to 10");
+
+                // drop the value so no one is using it anymore
+                drop(value);
+                thread::sleep(Duration::from_millis(200));
+
+                // read the value again, should be equal to 20
+                let value = rcu_2.read();
+                assert_eq!(*value, 20, "Value should be equal to 20");
+            });
+            thread::sleep(Duration::from_millis(100));
+            rcu.write(20);
+        });
+        assert!(
+            rcu.retired_list.lock().expect("lock poisoned").len() == 1,
+            "Doesnt have exatrly 1 element in retired list"
+        )
     }
 }
